@@ -1,0 +1,337 @@
+var s1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    roi = ee.FeatureCollection("users/jingyuanhuang771/BLHreservoir");
+//进行地形校正
+function slopeCorrection(image) { 
+  var imgGeom = image.geometry()
+  var srtm = ee.Image('JAXA/ALOS/AW3D30/V2_2').select('AVE_DSM').clip(imgGeom) 
+  var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0))
+  // Article ( numbers relate to chapters) 
+  // 2.1.1 Radar geometry 
+  var theta_i = image.select('angle')
+  var phi_i = ee.Terrain.aspect(theta_i)
+    .reduceRegion(ee.Reducer.mean(), theta_i.get('system:footprint'), 1000)
+    .get('aspect')
+  // 2.1.2 Terrain geometry
+  var alpha_s = ee.Terrain.slope(srtm).select('slope')
+  var phi_s = ee.Terrain.aspect(srtm).select('aspect')
+  // 2.1.3 Model geometry
+  // reduce to 3 angle
+  var phi_r = ee.Image.constant(phi_i).subtract(phi_s)
+  // convert all to radians
+  var phi_rRad = phi_r.multiply(Math.PI / 180);
+  var alpha_sRad = alpha_s.multiply(Math.PI / 180);
+  var theta_iRad = theta_i.multiply(Math.PI / 180);
+  var ninetyRad = ee.Image.constant(90).multiply(Math.PI / 180);
+  // slope steepness in range (eq. 2)
+  var alpha_r = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+  // slope steepness in azimuth (eq 3)
+  var alpha_az = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+  // local incidence angle (eq. 4)
+  var theta_lia = (alpha_az.cos().multiply((theta_iRad.subtract(alpha_r)).cos())).acos();
+  var theta_liaDeg = theta_lia.multiply(180 / Math.PI);
+  // 2.2 
+  // Gamma_nought_flat
+  var gamma0 = sigma0Pow.divide(theta_iRad.cos())
+  var gamma0dB = ee.Image.constant(10).multiply(gamma0.log10());
+  var ratio_1 = gamma0dB.select('VV').subtract(gamma0dB.select('VH'));
+  // Volumetric Model
+  var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_r)).tan();
+  var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+  var volModel = (nominator.divide(denominator)).abs();
+  // apply model
+  var gamma0_Volume = gamma0.divide(volModel);
+  var gamma0_VolumeDB = ee.Image.constant(10).multiply(gamma0_Volume.log10());
+  // we add a layover/shadow maskto the original implmentation
+  // layover, where slope > radar viewing angle 
+  var alpha_rDeg = alpha_r.multiply(180 / Math.PI);
+  var layover = alpha_rDeg.lt(theta_i);
+  // shadow where LIA > 90
+  var shadow = theta_liaDeg.lt(85);
+  // calculate the ratio for RGB vis
+  var ratio = gamma0_VolumeDB.select('VV').subtract(gamma0_VolumeDB.select('VH'));
+  var output = gamma0_VolumeDB.addBands(ratio).addBands(alpha_r).addBands(phi_s).addBands(theta_iRad)
+    .addBands(layover).addBands(shadow).addBands(gamma0dB).addBands(ratio_1);
+  return image.addBands(
+    output.select(['VV', 'VH', 'slope_1', 'slope_2'], ['VV', 'VH', 'layover', 'shadow']),
+    null,
+    true
+  ).addBands(image.select("angle"));
+}
+//进行滤波处理
+function PeronaMalik(I,iter, K, opt_method) {
+  iter = iter || 10;
+  K = K || 3;
+  var method = opt_method || 1;
+  // Define kernels
+  var dxW = ee.Kernel.fixed(3, 3,
+                           [[ 0,  0,  0],
+                            [ 1, -1,  0],
+                            [ 0,  0,  0]]);
+  var dxE = ee.Kernel.fixed(3, 3,
+                           [[ 0,  0,  0],
+                            [ 0, -1,  1],
+                            [ 0,  0,  0]]);
+  var dyN = ee.Kernel.fixed(3, 3,
+                           [[ 0,  1,  0],
+                            [ 0, -1,  0],
+                            [ 0,  0,  0]]);
+  var dyS = ee.Kernel.fixed(3, 3,
+                           [[ 0,  0,  0],
+                            [ 0, -1,  0],
+                            [ 0,  1,  0]]);
+  var lambda = 0.2;
+  var k1 = ee.Image(-1.0/K);
+  var k2 = ee.Image(K).multiply(ee.Image(K));
+  // Convolve
+  for(var i = 0; i < iter; i++) {
+    var dI_W = I.convolve(dxW);
+    var dI_E = I.convolve(dxE);
+    var dI_N = I.convolve(dyN);
+    var dI_S = I.convolve(dyS);
+  // Combine using choosen method
+    switch(method) {
+      case 1:
+        var cW = dI_W.multiply(dI_W).multiply(k1).exp();
+        var cE = dI_E.multiply(dI_E).multiply(k1).exp();
+        var cN = dI_N.multiply(dI_N).multiply(k1).exp();
+        var cS = dI_S.multiply(dI_S).multiply(k1).exp();
+        I = I.add(ee.Image(lambda).multiply(cN.multiply(dI_N).add(cS.multiply(dI_S)).add(cE.multiply(dI_E)).add(cW.multiply(dI_W))));
+        break;
+      case 2:
+        var cW = ee.Image(1.0).divide(ee.Image(1.0).add(dI_W.multiply(dI_W).divide(k2)));
+        var cE = ee.Image(1.0).divide(ee.Image(1.0).add(dI_E.multiply(dI_E).divide(k2)));
+        var cN = ee.Image(1.0).divide(ee.Image(1.0).add(dI_N.multiply(dI_N).divide(k2)));
+        var cS = ee.Image(1.0).divide(ee.Image(1.0).add(dI_S.multiply(dI_S).divide(k2)));
+        I = I.add(ee.Image(lambda).multiply(cN.multiply(dI_N).add(cS.multiply(dI_S)).add(cE.multiply(dI_E)).add(cW.multiply(dI_W))));
+        break;
+    }
+  }
+  return I;
+};
+//计算ostu阈值
+function otsu(histogram) {
+  // make sure histogram is an ee.Dictionary object
+  histogram = ee.Dictionary(histogram);
+  // extract relevant values into arrays
+  var counts = ee.Array(histogram.get('histogram'));
+  var means  = ee.Array(histogram.get('bucketMeans'));
+  // calculate single statistics over arrays
+  var size  = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum   = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean  = sum.divide(total);
+  // compute between sum of squares, where each mean partitions the data
+  var indices = ee.List.sequence(1, size);
+  var bss     = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount  = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans  = means.slice(0, 0, i);
+    var aMean   = aMeans.multiply(aCounts)
+      .reduce(ee.Reducer.sum(), [0]).get([0])
+      .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean  = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+        bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+  // return the mean value corresponding to the maximum BSS
+  return means.sort(bss).get([-1]);
+}
+//计算直方图
+function constructHistChart(histogram,threshold){
+  var counts = ee.List(histogram.get('histogram'));
+  var buckets = ee.List(histogram.get('bucketMeans'));
+  // construct array for visualization of threshold in chart
+  var segment = ee.List.repeat(0, counts.size());
+  var maxFrequency   = ee.Number(counts.reduce(ee.Reducer.max()));
+  var threshIndex    = buckets.indexOf(threshold);
+  segment            = segment.set(threshIndex, maxFrequency);
+  var histChart = ui.Chart.array.values(ee.Array.cat([counts, segment], 1), 0, buckets)
+    .setSeriesNames(['Values', 'Threshold'])
+    .setChartType('ColumnChart');
+    
+  return histChart;
+}
+//Edge Otsu Algorithms
+function edgeOtsu(img, kwargs) {
+  var geom = img.geometry();
+  // get list of band names used later
+  var bandList = img.bandNames();
+  var kwargDefaults = {
+    'initialThreshold': -14,
+    'reductionScale': 180,
+    'smoothing': 100,
+    'bandName': bandList.get(0),
+    'connectedPixels': 1000,
+    'edgeLength': 20,
+    'smoothEdges': 20,
+    'cannyThreshold': 1,
+    'cannySigma': 1,
+    'cannyLt': 0.05,
+    'maxBuckets': 255,
+    'minBucketWidth': 0.001,
+    'maxRaw': 1e6,
+    'invert': false,
+    'verbose': false
+  };
+  var kwargKeys = [];
+  for (var key in kwargDefaults) kwargKeys.push(key);
+  var params;
+  var i, k, v;
+  // loop through the keywords and construct ee.Dictionary from them,
+  // if the key is defined in the input then pass else use default
+  params = ee.Dictionary(kwargs);
+  for (i = 0; i < kwargKeys.length; i++) {
+    k = kwargKeys[i];
+    v = kwargDefaults[k];
+    params = ee.Dictionary(
+      ee.Algorithms.If(params.contains(k), params, params.set(k, v))
+    );
+  }
+  // parameters for all methods
+  var initialThreshold = ee.Number(params.get('initialThreshold')),
+    reductionScale = ee.Number(params.get('reductionScale')),
+    smoothing = ee.Number(params.get('smoothing')),
+    bandName = ee.String(params.get('bandName')),
+    connectedPixels = ee.Number(params.get('connectedPixels')),
+    edgeLength = ee.Number(params.get('edgeLength')),
+    smoothEdges = ee.Number(params.get('smoothEdges')),
+    cannyThreshold = ee.Number(params.get('cannyThreshold')),
+    cannySigma = ee.Number(params.get('cannySigma')),
+    cannyLt = ee.Number(params.get('cannyLt')),
+    maxBuckets = ee.Number(params.get('maxBuckets')),
+    minBucketWidth = ee.Number(params.get('minBucketWidth')),
+    maxRaw = ee.Number(params.get('maxRaw')),
+    invert = params.get('invert'),
+    verbose = params.get('verbose');
+
+
+  // get preliminary water
+  var binary = img.lt(initialThreshold).rename('binary');
+  // get canny edges
+  var canny = ee.Algorithms.CannyEdgeDetector(binary, cannyThreshold, cannySigma);
+  // process canny edges
+  var connected = canny.updateMask(canny).lt(cannyLt).connectedPixelCount(connectedPixels, true);
+  var edges = connected.gte(edgeLength);
+  edges = edges.updateMask(edges);
+  var edgeBuffer = edges.focal_max(smoothEdges, 'square', 'meters');
+  // get histogram for Otsu
+  var histogram_image = img.updateMask(edgeBuffer);
+  // histogram_image = histogram_image.clip(geometry2)
+  var histogram = ee.Dictionary(histogram_image.reduceRegion({
+    reducer: ee.Reducer.histogram(maxBuckets, minBucketWidth, maxRaw)
+      .combine('mean', null, true).combine('variance', null, true),
+    geometry: geom,
+    scale: reductionScale,
+    maxPixels: 1e13,
+    tileScale: 16
+  }).get(bandName.cat('_histogram')));
+  var threshold = otsu(histogram);
+
+  // segment image and mask 0 values (not water)
+  var waterImg = ee.Image(ee.Algorithms.If(invert, img.gt(threshold), img.lt(threshold)));
+  return waterImg;
+}
+function clipToROI(image) {
+  return image.clip(roi);
+}
+function extractDateFromIndex(image) {
+  // 获取图像的system:index属性
+  var index = ee.String(image.get('system:index'));
+  // 使用字符串操作提取日期部分（假设日期始终位于相同的位置）
+  var dateString = index.slice(17, 25); // 从索引17开始截取8个字符
+  // 将提取的字符串重新格式化为"YYYY-MM-DD"
+  var formattedDate = dateString.slice(0, 4)
+                      .cat('-')
+                      .cat(dateString.slice(4, 6))
+                      .cat('-')
+                      .cat(dateString.slice(6, 8));
+  // 将格式化的日期作为新属性添加到图像上
+  return image.set('extracted_date', formattedDate);
+}
+function processImage(image) {
+  // 使用 connectedPixelCount 方法创建遮罩
+  var mask = image.connectedPixelCount(100, true);
+  // 更新图像的遮罩
+  var updatedImage = image.updateMask(mask.gte(100));
+  // 计算水域面积
+  var area = ee.Image.pixelArea().multiply(updatedImage);
+  var dict = area.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: 10,
+    maxPixels: 1e13, 
+    tileScale: 16
+  });
+  // 将水域面积作为属性添加到图像中
+  return updatedImage.set("area", ee.Number(dict.get("area")).divide(1000000));
+}
+Map.centerObject(roi,10);
+var s1col = s1.filterBounds(roi)
+              .filterDate(ee.Date.fromYMD(2021,1,1),ee.Date.fromYMD(2022,1,1))
+              .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+              .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+              .filter(ee.Filter.eq("instrumentMode", "IW"))
+              //相对轨道号，这里用这个是因为有一些影 像的边边角角会被筛选进来
+              .filter(ee.Filter.or(
+              ee.Filter.eq("relativeOrbitNumber_start", 98),
+              ee.Filter.eq("relativeOrbitNumber_start", 3)
+               ))
+              .map(function(image) {
+                var time_start = image.get("system:time_start");
+                return image.set("date", ee.Date(time_start).format("yyyyMMdd"));
+              })
+              .sort("system:time_start");
+print("s1col", s1col);
+Map.addLayer(s1col, {bands:'VV',min:-25,max:0},'Sentinel-1');
+var s1col_1 = s1col.map(slopeCorrection).map(PeronaMalik).map(clipToROI)
+Map.addLayer(s1col_1, {bands:'VV',min:-25,max:0},'Sentinel-chuli');       
+print('s1col_1',s1col_1)
+// 应用函数到图像集合
+var waterEdgesCollection = s1col_1.select('VV').map(function (image) {
+  return edgeOtsu(image, {
+    'initialThreshold': -14,
+    'reductionScale': 180,
+    'smoothing': 100,
+    'connectedPixels': 100,
+    'edgeLength': 20,
+    'smoothEdges': 20,
+    'cannyThreshold': 1,
+    'cannySigma': 1,
+    'cannyLt': 0.05,
+    'maxBuckets': 255,
+    'minBucketWidth': 0.001,
+    'maxRaw': 1e6,
+    'invert': false,
+    'verbose': false
+  });
+});
+// 输出图像集合
+print("Water Edge Images:", waterEdgesCollection);
+Map.addLayer(waterEdgesCollection.first(), {bands:'VV',min:0,max:1},'waterEdgesCollection'); 
+var updatedImages = waterEdgesCollection.map(processImage);
+// 打印更新后的图像集合
+print("Updated Images:", updatedImages);
+var updatedImages_1 = updatedImages.map(extractDateFromIndex);
+//假设waterImgCol已经包含了每个图像的'extracted_date'属性
+var featureCollection = updatedImages_1.map(function(image) {
+  // 获取提取的日期字符串
+  var extractedDate = image.get('extracted_date');
+  var area = ee.Number(image.get('area'));
+  // 使用提取的日期作为Feature的属性
+  return ee.Feature(null, {'extracted_date': extractedDate, 'area': area});
+});
+// 使用ui.Chart来绘制面积随提取的时间变化的散点图
+var chart = ui.Chart.feature.byFeature({
+  features: featureCollection,
+  xProperty: 'extracted_date', // 使用'extracted_date'作为x轴属性
+  yProperties: ['area']
+})
+.setOptions({
+  title: 'Water Area Over Time',
+  hAxis: {title: 'Time', format: 'yyyy-MM-dd', gridlines: {count: 15}},
+  vAxis: {title: 'Area (sq km)'},
+  pointSize: 4,
+  dataOpacity: 0.6
+});
+print(chart);
